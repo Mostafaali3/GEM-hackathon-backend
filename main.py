@@ -37,6 +37,12 @@ def on_startup():
 @app.post("/visitors/", response_model=Visitor)
 def create_visitor(visitor: Visitor, session: Session = Depends(get_session)):
     """Register a new visitor (only email is strictly required)."""
+    # Check if user with this email already exists
+    existing_user = session.exec(select(Visitor).where(Visitor.email == visitor.email)).first()
+    if existing_user:
+        # Return existing user instead of creating duplicate
+        return existing_user
+    
     session.add(visitor)
     session.commit()
     session.refresh(visitor)
@@ -126,6 +132,18 @@ class RegisterVirtualNFCResponse(BaseModel):
     user_id: int
     virtual_nfc_id: str
 
+class LoginRegisterRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+    gender: Optional[str] = None
+    virtual_nfc_id: str
+
+class LoginRegisterResponse(BaseModel):
+    status: str
+    message: str
+    user: Visitor
+    is_new_user: bool
+
 class LinkCardRequest(BaseModel):
     user_id: int
     card_uid: str
@@ -144,6 +162,62 @@ class GateScanResponse(BaseModel):
     user_name: Optional[str] = None
     welcome_message: Optional[str] = None
 
+@app.post("/api/auth/login-register", response_model=LoginRegisterResponse)
+def login_or_register(
+    request: LoginRegisterRequest,
+    session: Session = Depends(get_session)
+):
+    """
+    Combined login/register endpoint for mobile app.
+    
+    - If user exists: Update their virtual_nfc_id and return user data
+    - If user doesn't exist: Create new user with virtual_nfc_id
+    
+    This is the PRIMARY endpoint mobile apps should call on login.
+    """
+    # Check if user exists
+    existing_user = session.exec(
+        select(Visitor).where(Visitor.email == request.email)
+    ).first()
+    
+    if existing_user:
+        # User exists - update their virtual NFC ID
+        existing_user.virtual_nfc_id = request.virtual_nfc_id
+        if request.name:
+            existing_user.name = request.name
+        if request.gender:
+            existing_user.gender = request.gender
+        
+        session.add(existing_user)
+        session.commit()
+        session.refresh(existing_user)
+        
+        return LoginRegisterResponse(
+            status="success",
+            message="Login successful",
+            user=existing_user,
+            is_new_user=False
+        )
+    else:
+        # Create new user with virtual NFC ID
+        new_user = Visitor(
+            email=request.email,
+            name=request.name,
+            gender=request.gender,
+            virtual_nfc_id=request.virtual_nfc_id
+        )
+        
+        session.add(new_user)
+        session.commit()
+        session.refresh(new_user)
+        
+        return LoginRegisterResponse(
+            status="success",
+            message="Account created successfully",
+            user=new_user,
+            is_new_user=True
+        )
+
 @app.post("/api/nfc/register", response_model=RegisterVirtualNFCResponse)
 def register_virtual_nfc(
     request: RegisterVirtualNFCRequest,
@@ -151,14 +225,9 @@ def register_virtual_nfc(
 ):
     """
     Register or update a user's virtual NFC ID from their mobile app.
-    Called when the user logs in to the mobile app for the first time.
     
-    Mobile App Flow:
-    1. User logs in/creates account
-    2. App generates a unique virtual_nfc_id (UUID or custom format)
-    3. App stores it securely (SharedPreferences/Keychain)
-    4. App calls this endpoint to register it with the backend
-    5. This ID is fixed and reused for all future sessions
+    NOTE: Mobile apps should use POST /api/auth/login-register instead.
+    This endpoint is kept for backward compatibility and manual NFC ID updates.
     """
     # A. Validate user exists
     user = session.get(Visitor, request.user_id)

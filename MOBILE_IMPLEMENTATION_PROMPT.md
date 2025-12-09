@@ -46,6 +46,22 @@ const val BASE_URL = "http://YOUR_SERVER_IP:8000/"
 
 #### **Data Classes**
 ```kotlin
+// PRIMARY LOGIN/REGISTER ENDPOINT (Use this!)
+data class LoginRegisterRequest(
+    val email: String,
+    val name: String?,
+    val gender: String?,
+    val virtual_nfc_id: String
+)
+
+data class LoginRegisterResponse(
+    val status: String,
+    val message: String,
+    val user: Visitor,
+    val is_new_user: Boolean
+)
+
+// Legacy NFC registration (use login-register instead)
 data class RegisterNFCRequest(
     val user_id: Int,
     val virtual_nfc_id: String
@@ -101,6 +117,13 @@ data class Visitor(
 ```kotlin
 interface GemApiService {
     
+    // PRIMARY ENDPOINT - Use this for login/register!
+    @POST("api/auth/login-register")
+    suspend fun loginOrRegister(
+        @Body request: LoginRegisterRequest
+    ): Response<LoginRegisterResponse>
+    
+    // Legacy endpoints (optional)
     @POST("api/nfc/register")
     suspend fun registerVirtualNFC(
         @Body request: RegisterNFCRequest
@@ -125,6 +148,8 @@ interface GemApiService {
     suspend fun getAllVisitors(): Response<List<Visitor>>
 }
 ```
+
+**IMPORTANT**: Use `POST /api/auth/login-register` as your primary authentication endpoint. It handles both new user creation and existing user login in a single call, and automatically registers the NFC ID.
 
 ---
 
@@ -164,7 +189,46 @@ class NFCManager(private val context: Context) {
     }
     
     /**
-     * Register Virtual NFC ID with backend
+     * Login or register user with NFC ID in one call
+     * This is the PRIMARY method to use
+     */
+    suspend fun loginOrRegister(
+        email: String,
+        name: String?,
+        virtualNfcId: String
+    ): Result<LoginRegisterResponse> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val request = LoginRegisterRequest(
+                    email = email,
+                    name = name,
+                    gender = null,
+                    virtual_nfc_id = virtualNfcId
+                )
+                
+                val response = apiService.loginOrRegister(request)
+                
+                if (response.isSuccessful && response.body() != null) {
+                    val result = response.body()!!
+                    
+                    // Store the virtual NFC ID
+                    sharedPrefs.edit()
+                        .putString(KEY_VIRTUAL_NFC_ID, virtualNfcId)
+                        .putBoolean(KEY_IS_REGISTERED, true)
+                        .apply()
+                    
+                    Result.success(result)
+                } else {
+                    Result.failure(Exception("Login/Register failed: ${response.code()}"))
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Register Virtual NFC ID with backend (LEGACY - use loginOrRegister instead)
      * Call this after user login
      */
     suspend fun registerWithBackend(userId: Int): Result<RegisterNFCResponse> {
@@ -194,8 +258,6 @@ class NFCManager(private val context: Context) {
             }
         }
     }
-    
-    /**
      * Check if already registered
      */
     fun isRegistered(): Boolean {
@@ -292,7 +354,64 @@ class GemHceService : HostApduService() {
 
 ### 5. **User Login/Registration Flow**
 
-Implement this flow in your login/registration activity:
+Implement this **SIMPLIFIED** flow in your login/registration activity:
+
+```kotlin
+class LoginActivity : AppCompatActivity() {
+    
+    private lateinit var nfcManager: NFCManager
+    private val viewModelScope = CoroutineScope(Dispatchers.Main + Job())
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        nfcManager = NFCManager(this)
+    }
+    
+    private fun onLoginOrRegister(email: String, name: String?) {
+        viewModelScope.launch {
+            try {
+                showLoading("Logging in...")
+                
+                // Generate or get existing Virtual NFC ID
+                val virtualNfcId = nfcManager.getOrCreateVirtualNfcId(0) // userId not needed yet
+                
+                // Single API call handles everything!
+                val result = nfcManager.loginOrRegister(
+                    email = email,
+                    name = name,
+                    virtualNfcId = virtualNfcId
+                )
+                
+                if (result.isSuccess) {
+                    val response = result.getOrNull()!!
+                    val user = response.user
+                    
+                    if (response.is_new_user) {
+                        showToast("Welcome ${user.name}! Account created ✓")
+                    } else {
+                        showToast("Welcome back ${user.name}!")
+                    }
+                    
+                    hideLoading()
+                    navigateToMainScreen(user.id, user.name ?: user.email)
+                } else {
+                    hideLoading()
+                    showError("Login failed: ${result.exceptionOrNull()?.message}")
+                }
+                
+            } catch (e: Exception) {
+                hideLoading()
+                showError("Error: ${e.message}")
+            }
+        }
+    }
+}
+```
+
+### OLD FLOW (Don't use this anymore)
+<details>
+<summary>Click to see the old two-step flow (deprecated)</summary>
 
 ```kotlin
 class LoginActivity : AppCompatActivity() {
@@ -378,6 +497,7 @@ class LoginActivity : AppCompatActivity() {
     }
 }
 ```
+</details>
 
 ---
 
@@ -544,16 +664,17 @@ dependencies {
 **Key Points:**
 1. ✅ Generate `virtual_nfc_id` on first launch/login
 2. ✅ Store it permanently in SharedPreferences
-3. ✅ Register it with backend via `POST /api/nfc/register`
+3. ✅ **Use single endpoint `POST /api/auth/login-register`** - handles everything!
 4. ✅ Implement HCE service to broadcast the ID
 5. ✅ ID is **fixed forever** - never regenerated
 6. ✅ Use the same ID for all future gate entries
 
-**API Endpoints to Implement:**
-- `POST /api/nfc/register` - Register virtual NFC (call once after login)
+**PRIMARY API Endpoint:**
+- `POST /api/auth/login-register` - **ONE CALL** for login/register + NFC registration
+
+**Optional Endpoints:**
 - `POST /api/cards/link` - Link physical card (optional feature)
 - `POST /api/gate/scan` - Test gate authentication (for debugging)
-- `POST /visitors/` - Create new visitor account
 - `GET /visitors/` - List visitors (admin feature)
 
 **Backend Base URL:**
