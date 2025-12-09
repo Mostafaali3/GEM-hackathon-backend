@@ -9,12 +9,96 @@ from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select, desc, or_
 from pydantic import BaseModel
 
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
 # Import the tables and engine from your existing database.py file
 from database import Visitor, Room, PhotoSubmission, engine, create_db_and_tables
+# LangChain Imports
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
-# 1. APP SETUP
-# ------------
-app = FastAPI(title="Museum Smart System")
+
+# Configuration
+CHROMA_PATH = "./chroma_db"
+OLLAMA_MODEL = "deepseek-v3.1.671b-cloud" # Make sure to pull this model: `ollama pull llama3`
+
+# Global variable to hold the chain
+rag_chain = None
+class QueryRequest(BaseModel):
+    question: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    
+    
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Initialize Database (Moved from on_startup)
+    create_db_and_tables()
+    
+    global rag_chain
+    
+    # 2. Initialize Embeddings
+    print("Loading Embeddings...")
+    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+
+    # 3. Load existing VectorDB
+    if not os.path.exists(CHROMA_PATH):
+        # Graceful handling if DB doesn't exist yet
+        print("⚠️ Warning: Chroma DB not found. RAG will not work until ingest.py is run.")
+    else:
+        vector_db = Chroma(
+            persist_directory=CHROMA_PATH,
+            embedding_function=embeddings
+        )
+
+        # 4. Initialize LLM
+        llm = ChatOllama(model="deepseek-v3.1:671b-cloud", temperature=0.2)
+
+        # 5. Create RAG Chain
+        retriever = vector_db.as_retriever(search_kwargs={"k": 5})
+        
+        template = """
+        You are a helpful assistant. Use ONLY the context below to answer the question.
+        If the answer is not in the context, say "I don't know."
+        
+        just give the answer as it will be shown to the user
+        
+        Context:
+        {context}
+        
+        Question:
+        {question}
+        
+        Answer:
+        """
+        
+        prompt = PromptTemplate.from_template(template)
+        
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
+        rag_chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        print("✅ RAG Pipeline loaded successfully.")
+    
+    yield
+    # (Optional) Clean up resources on shutdown
+    print("🛑 Server shutting down.")
+
+# --- CONNECT LIFESPAN TO APP HERE ---
+app = FastAPI(title="Museum Smart System", lifespan=lifespan)
 
 # Create a folder for uploaded images
 IMAGEDIR = "static/submissions/"
@@ -31,7 +115,7 @@ def get_session():
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
-
+    
 # 2. VISITOR ENDPOINTS
 # --------------------
 @app.post("/visitors/", response_model=Visitor)
@@ -52,6 +136,18 @@ def create_visitor(visitor: Visitor, session: Session = Depends(get_session)):
 def list_visitors(session: Session = Depends(get_session)):
     return session.exec(select(Visitor)).all()
 
+
+@app.post("/ask", response_model=QueryResponse)
+async def ask_question(request: QueryRequest):
+    if not rag_chain:
+        raise HTTPException(status_code=500, detail="RAG chain not initialized")
+    
+    try:
+        # Invoke the chain
+        response_text = rag_chain.invoke(request.question)
+        return QueryResponse(answer=response_text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 # 3. PHOTOGRAPHY COMPETITION ENDPOINTS
 # ------------------------------------
 @app.post("/upload-photo/")
@@ -161,6 +257,8 @@ class GateScanResponse(BaseModel):
     status: str
     user_name: Optional[str] = None
     welcome_message: Optional[str] = None
+    
+
 
 @app.post("/api/auth/login-register", response_model=LoginRegisterResponse)
 def login_or_register(
