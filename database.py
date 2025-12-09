@@ -10,7 +10,10 @@ class Visitor(SQLModel, table=True):
     name: Optional[str] = None
     gender: Optional[str] = None 
     joined_at: datetime = Field(default_factory=datetime.utcnow)
-    # nfc_tag: Optional[str] = Field(unique=True)
+    
+    # Hybrid NFC Access System Fields
+    virtual_nfc_id: Optional[str] = Field(default=None, unique=True, index=True)  # Phone HCE ID (e.g., 'GEM_USER_001')
+    physical_card_id: Optional[str] = Field(default=None, unique=True, index=True)  # Souvenir Card UID (e.g., '04:A2:55...')
 
 class Room(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
