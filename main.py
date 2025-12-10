@@ -3,7 +3,6 @@ import shutil
 from uuid import uuid4
 from datetime import datetime, timedelta
 from typing import List, Optional
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,16 +37,35 @@ class QueryResponse(BaseModel):
     
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Initialize Database (Moved from on_startup)
+    # 1. Initialize Database
     create_db_and_tables()
+    
+    # 2. Seed Rooms (moved from on_event startup)
+    with Session(engine) as session:
+        existing_rooms = session.exec(select(Room)).first()
+        if not existing_rooms:
+            room_names = [
+                "Royal Treasures", "Sacred Tombs", "Temple of Gods",
+                "Daily Life Hall", "Hieroglyph Gallery", "Mummification Chamber",
+                "War & Conquest", "Artisan Workshop", "Jewelry & Beauty",
+                "Great Hall", "Astronomy Tower", "Scribes Library"
+            ]
+            for i, name in enumerate(room_names, 1):
+                room = Room(id=i, name=name, description=f"Museum room: {name}")
+                session.add(room)
+            session.commit()
+            print(f"✅ Created {len(room_names)} rooms")
+        else:
+            room_count = len(session.exec(select(Room)).all())
+            print(f"ℹ️  Rooms already exist ({room_count} rooms in database)")
     
     global rag_chain
     
-    # 2. Initialize Embeddings
+    # 3. Initialize Embeddings
     print("Loading Embeddings...")
     embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
-    # 3. Load existing VectorDB
+    # 4. Load existing VectorDB
     if not os.path.exists(CHROMA_PATH):
         # Graceful handling if DB doesn't exist yet
         print("⚠️ Warning: Chroma DB not found. RAG will not work until ingest.py is run.")
@@ -57,10 +75,10 @@ async def lifespan(app: FastAPI):
             embedding_function=embeddings
         )
 
-        # 4. Initialize LLM
+        # 5. Initialize LLM
         llm = ChatOllama(model="deepseek-v3.1:671b-cloud", temperature=0.2)
 
-        # 5. Create RAG Chain
+        # 6. Create RAG Chain
         retriever = vector_db.as_retriever(search_kwargs={"k": 5})
         
         template = """
@@ -119,10 +137,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def get_session():
     with Session(engine) as session:
         yield session
-
-@app.on_event("startup")
-def on_startup():
-    create_db_and_tables()
     
 # 2. VISITOR ENDPOINTS
 # --------------------
@@ -202,15 +216,16 @@ def upload_photo(
     session.refresh(photo)
     return {"status": "success", "photo": photo}
 
-@app.get("/rooms/{room_id}/dashboard", response_model=List[PhotoSubmission])
+@app.get("/rooms/{room_id}/dashboard")
 def get_room_dashboard(room_id: int, session: Session = Depends(get_session)):
     """
     Returns the Top 3 photos for this room uploaded in the last hour.
+    Includes visitor information for each photo.
     """
     # Calculate time 1 hour ago
     one_hour_ago = datetime.utcnow() - timedelta(hours=1)
     
-    # Logic: Select Photos -> Where Room matches -> Where time > 1 hour ago -> Order by Score -> Top 3
+    # Select Photos: Room matches, time > 1 hour ago, Order by Score, Top 3
     statement = (
         select(PhotoSubmission)
         .where(PhotoSubmission.room_id == room_id)
@@ -219,8 +234,30 @@ def get_room_dashboard(room_id: int, session: Session = Depends(get_session)):
         .limit(3)
     )
     
-    results = session.exec(statement).all()
-    return results  
+    photos = session.exec(statement).all()
+    
+    # Include visitor data for each photo
+    result = []
+    for photo in photos:
+        visitor = session.get(Visitor, photo.visitor_id)
+        photo_dict = {
+            "id": photo.id,
+            "image_url": photo.image_url,
+            "visitor_id": photo.visitor_id,
+            "room_id": photo.room_id,
+            "created_at": photo.created_at.isoformat(),
+            "score": photo.score,
+            "is_hourly_winner": photo.is_hourly_winner,
+            "visitor": {
+                "id": visitor.id,
+                "email": visitor.email,
+                "name": visitor.name,
+                "gender": visitor.gender
+            } if visitor else None
+        }
+        result.append(photo_dict)
+    
+    return result
 
 # 4. NFC ACCESS SYSTEM ENDPOINTS
 # -------------------------------
